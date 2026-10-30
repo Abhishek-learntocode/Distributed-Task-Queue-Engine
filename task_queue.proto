@@ -1,0 +1,135 @@
+syntax = "proto3";
+
+package task_queue;
+
+// The Task Queue service acts as the central coordinator in our
+// distributed task processing system. It manages two separate
+// FIFO queues (one for CPU-bound tasks, one for IO-bound tasks)
+// and handles worker lifecycle including registration, task
+// assignment, health monitoring, and failure recovery.
+//
+// Design decision: RequestTask uses server-side streaming because
+// the assignment specifies that "the server pushes the task to
+// the worker when available". A streaming RPC lets the server
+// keep the connection open and push tasks as they become ready,
+// rather than requiring workers to repeatedly poll.
+
+service TaskQueueService {
+  // Job clients use this to add new tasks to the system.
+  // Server places the task in the appropriate FIFO queue
+  // and returns a unique identifier for tracking.
+  rpc SubmitTask (TaskRequest) returns (TaskResponse);
+
+  // Job clients poll this to monitor their submitted tasks.
+  // Returns the current lifecycle state of a specific task.
+  rpc GetTaskStatus (TaskStatusRequest) returns (TaskStatusResponse);
+
+  // Workers call this once at startup to announce themselves
+  // and declare what type of work they can handle.
+  rpc RegisterWorker (WorkerConfig) returns (WorkerRegistration);
+
+  // Server-side streaming: worker opens this stream and the
+  // server sends tasks through it one at a time. The worker
+  // must complete a task before the server sends another one.
+  // If no matching task is available, the server holds the
+  // stream open until one arrives.
+  rpc RequestTask (WorkerIdentifier) returns (stream TaskAssignment);
+
+  // Workers send these periodically (every 5 seconds) so the
+  // server knows they are still alive. Missing 3 consecutive
+  // heartbeats (15 seconds) triggers failure handling.
+  rpc SendHeartbeat (HeartbeatMessage) returns (ServerAck);
+
+  // After processing a task, workers call this to report
+  // whether the task completed successfully or failed.
+  rpc UpdateTaskStatus (TaskResult) returns (ServerAck);
+}
+
+// ---- Enumerations ----
+
+// Distinguishes between compute-heavy and IO-heavy tasks.
+// The server uses this to route tasks to the correct queue.
+enum TaskType {
+  CPU = 0;
+  IO = 1;
+}
+
+// Tracks the lifecycle of each task through the system.
+// A task starts as QUEUED, moves to PROCESSING when assigned,
+// and ends as either COMPLETED or FAILED.
+enum TaskStatus {
+  QUEUED = 0;
+  PROCESSING = 1;
+  COMPLETED = 2;
+  FAILED = 3;
+}
+
+// Workers declare their processing capability at registration.
+// This determines which queue(s) the server draws from when
+// assigning tasks to this worker.
+enum WorkerCapability {
+  CPU_WORKER = 0;
+  IO_WORKER = 1;
+  BOTH_CAPABLE = 2;
+}
+
+// ---- Messages used by Job Client ----
+
+message TaskRequest {
+  TaskType task_type = 1;
+  string payload = 2;   // CPU: matrix dimension N, IO: sleep seconds N
+}
+
+message TaskResponse {
+  string task_id = 1;
+}
+
+message TaskStatusRequest {
+  string task_id = 1;
+}
+
+message TaskStatusResponse {
+  string task_id = 1;
+  TaskStatus status = 2;
+  string assigned_worker = 3;  // empty if task is still queued
+}
+
+// ---- Messages used by Workers ----
+
+message WorkerConfig {
+  WorkerCapability capability = 1;
+}
+
+// Returned to the worker after successful registration
+message WorkerRegistration {
+  string worker_id = 1;
+}
+
+// Identifies a worker for task requests and heartbeats
+message WorkerIdentifier {
+  string worker_id = 1;
+}
+
+// A task pushed to a worker through the streaming RPC
+message TaskAssignment {
+  string task_id = 1;
+  TaskType task_type = 2;
+  string payload = 3;
+}
+
+message HeartbeatMessage {
+  string worker_id = 1;
+}
+
+// Generic server acknowledgment for heartbeats and status updates
+message ServerAck {
+  bool acknowledged = 1;
+  string info = 2;
+}
+
+// Worker reports the outcome after processing a task
+message TaskResult {
+  string task_id = 1;
+  string worker_id = 2;
+  TaskStatus status = 3;   // should be COMPLETED or FAILED
+}
